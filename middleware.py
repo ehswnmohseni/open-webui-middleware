@@ -6,6 +6,7 @@ import base64
 import textwrap
 
 import asyncio
+from aiocache import cached
 from typing import Any, Optional
 import random
 import json
@@ -22,24 +23,15 @@ from fastapi import Request, HTTPException
 from fastapi.responses import HTMLResponse
 from starlette.responses import Response, StreamingResponse, JSONResponse
 
-import os
-import hashlib
-try:
-    import PyPDF2
-except ImportError:
-    import pypdf as PyPDF2
-
 
 from open_webui.utils.misc import is_string_allowed
 from open_webui.models.oauth_sessions import OAuthSessions
 from open_webui.models.chats import Chats
-from open_webui.models.files import Files
 from open_webui.models.folders import Folders
 from open_webui.models.users import Users
 from open_webui.socket.main import (
     get_event_call,
     get_event_emitter,
-    get_active_status_by_user_id,
 )
 from open_webui.routers.tasks import (
     generate_queries,
@@ -466,12 +458,6 @@ async def chat_completion_tools_handler(
                             }
                         )
 
-                print(
-                    f"Tool {tool_function_name} result: {tool_result}",
-                    tool_result_files,
-                    tool_result_embeds,
-                )
-
                 if tool_result:
                     tool = tools[tool_function_name]
                     tool_id = tool.get("tool_id", "")
@@ -497,12 +483,6 @@ async def chat_completion_tools_handler(
                             ],
                             "tool_result": True,
                         }
-                    )
-
-                    # Citation is not enabled for this tool
-                    body["messages"] = add_or_update_user_message(
-                        f"\nTool `{tool_name}` Output: {tool_result}",
-                        body["messages"],
                     )
 
                     if (
@@ -780,19 +760,23 @@ async def chat_image_generation_handler(
     if not chat_id:
         return form_data
 
-    chat = Chats.get_chat_by_id_and_user_id(chat_id, user.id)
-
     __event_emitter__ = extra_params["__event_emitter__"]
-    await __event_emitter__(
-        {
-            "type": "status",
-            "data": {"description": "Creating image", "done": False},
-        }
-    )
 
-    messages_map = chat.chat.get("history", {}).get("messages", {})
-    message_id = chat.chat.get("history", {}).get("currentId")
-    message_list = get_message_list(messages_map, message_id)
+    if chat_id.startswith("local:"):
+        message_list = form_data.get("messages", [])
+    else:
+        chat = Chats.get_chat_by_id_and_user_id(chat_id, user.id)
+        await __event_emitter__(
+            {
+                "type": "status",
+                "data": {"description": "Creating image", "done": False},
+            }
+        )
+
+        messages_map = chat.chat.get("history", {}).get("messages", {})
+        message_id = chat.chat.get("history", {}).get("currentId")
+        message_list = get_message_list(messages_map, message_id)
+
     user_message = get_last_user_message(message_list)
 
     prompt = user_message
@@ -852,7 +836,7 @@ async def chat_image_generation_handler(
                 }
             )
 
-            system_message_content = f"<context>Image generation was attempted but failed. The system is currently unable to generate the image. Tell the user that an error occurred: {error_message}</context>"
+            system_message_content = f"<context>Image generation was attempted but failed. The system is currently unable to generate the image. Tell the user that the following error occurred: {error_message}</context>"
 
     else:
         # Create image(s)
@@ -915,7 +899,7 @@ async def chat_image_generation_handler(
                 }
             )
 
-            system_message_content = "<context>The requested image has been created and is now being shown to the user. Let them know that it has been generated.</context>"
+            system_message_content = "<context>The requested image has been created by the system successfully and is now being shown to the user. Let the user know that the image they requested has been generated and is now shown in the chat.</context>"
         except Exception as e:
             log.debug(e)
 
@@ -936,7 +920,7 @@ async def chat_image_generation_handler(
                 }
             )
 
-            system_message_content = f"<context>Image generation was attempted but failed. The system is currently unable to generate the image. Tell the user that an error occurred: {error_message}</context>"
+            system_message_content = f"<context>Image generation was attempted but failed because of an error. The system is currently unable to generate the image. Tell the user that the following error occurred: {error_message}</context>"
 
     if system_message_content:
         form_data["messages"] = add_or_update_system_message(
@@ -1115,7 +1099,6 @@ def apply_params_to_form_data(form_data, model):
     return form_data
 
 
-#check here
 async def process_chat_payload(request, form_data, user, metadata, model):
     # Pipeline Inlet -> Filter Inlet -> Chat Memory -> Chat Web Search -> Chat Image Generation
     # -> Chat Code Interpreter (Form Data Update) -> (Default) Chat Tools Function Calling
@@ -1130,7 +1113,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             form_data = apply_system_prompt_to_body(
                 system_message.get("content"), form_data, metadata, user, replace=True
             )  # Required to handle system prompt variables
-        except Exception:
+        except:
             pass
 
     event_emitter = get_event_emitter(metadata)
@@ -1193,135 +1176,48 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                         *form_data.get("files", []),
                     ]
 
+    # Model "Knowledge" handling
     user_message = get_last_user_message(form_data["messages"])
-    model_knowledge = True
+    model_knowledge = model.get("info", {}).get("meta", {}).get("knowledge", False)
 
-    if model_knowledge and user_message:
-        # emit start searching status
-        try:
-            await event_emitter({
+    if model_knowledge:
+        await event_emitter(
+            {
                 "type": "status",
                 "data": {
-                    "action": "documents_search",
+                    "action": "knowledge_search",
                     "query": user_message,
                     "done": False,
                 },
-            })
-        except Exception:
-            pass
-
-        # Prefer common Colab/path locations; choose first existing
-        candidate_paths = [
-            "/content/documents",
-            "content/documents",
-            "./documents",
-            "/documents",
-        ]
-        local_documents_path = None
-        for p in candidate_paths:
-            if os.path.exists(p) and os.path.isdir(p):
-                local_documents_path = p
-                break
+            }
+        )
 
         knowledge_files = []
-
-        if local_documents_path:
-            for filename in os.listdir(local_documents_path):
-                if not filename.lower().endswith(".pdf"):
-                    continue
-                full_path = os.path.join(local_documents_path, filename)
-                if not os.path.isfile(full_path):
-                    continue
-                try:
-                    st = os.stat(full_path)
-                    # use path + mtime + size to generate a stable id for file changes
-                    file_hash = hashlib.md5(f"{full_path}_{int(st.st_mtime)}_{st.st_size}".encode()).hexdigest()[:16]
-                    file_id = f"local_pdf_{file_hash}"
-                except Exception:
-                    file_id = f"local_pdf_{hash(filename) & 0xFFFF_FFFF:08x}"
-
-                knowledge_files.append({
-                    "id": file_id,
-                    "name": filename,
-                    "type": "file",
-                    "source": "local_documents",
-                    "path": full_path,
-                    "legacy": False
-                })
-
-                log.debug(f"Knowledge candidate added: {filename}")
-
-        existing_metadata_files = metadata.get("files", []) or []
-        existing_ids = {f.get("id") for f in existing_metadata_files if f.get("id")}
-
-        new_knowledge_files = [
-            f for f in knowledge_files
-            if f.get("id") not in existing_ids
-        ]
-
-        # merge into metadata.files
-        metadata["files"] = existing_metadata_files + new_knowledge_files
-
-        # emit done searching status
-        try:
-            await event_emitter({
-                "type": "status",
-                "data": {
-                    "action": "documents_search",
-                    "query": user_message,
-                    "done": True,
-                    "documents_count": len(new_knowledge_files),
-                },
-            })
-        except Exception:
-            pass
-
-        # Build context from new documents and inject into user message (RAG)
-        try:
-            context_text_parts = []
-            # safety cap to avoid extremely large prompts (adjust as needed)
-            MAX_CONTEXT_CHARS = 150_000
-
-            for file_info in new_knowledge_files:
-                file_path = file_info.get("path")
-                if not file_path or not os.path.exists(file_path):
-                    continue
-                try:
-                    with open(file_path, "rb") as f:
-                        reader = PyPDF2.PdfReader(f)
-                        text_output = ""
-                        for page in reader.pages:
-                            try:
-                                text = page.extract_text()
-                            except Exception:
-                                text = None
-                            if text and text.strip():
-                                text_output += text.strip() + "\n\n"
-                            # break early if too large
-                            if len("".join(context_text_parts)) + len(text_output) > MAX_CONTEXT_CHARS:
-                                break
-                        if text_output.strip():
-                            context_text_parts.append(f"\n--- {file_info['name']} ---\n{text_output}\n")
-                except Exception as e:
-                    log.debug(f"Failed to read PDF {file_path}: {e}")
-                    continue
-
-            context_text = "".join(context_text_parts).strip()
-            if context_text:
-                enhanced_message = (
-                    f"{user_message}\n\n"
-                    f"Please use the following documents as context:\n{context_text}"
+        for item in model_knowledge:
+            if item.get("collection_name"):
+                knowledge_files.append(
+                    {
+                        "id": item.get("collection_name"),
+                        "name": item.get("name"),
+                        "legacy": True,
+                    }
                 )
-                form_data["messages"] = add_or_update_user_message(
-                    enhanced_message,
-                    form_data["messages"],
-                    append=False
+            elif item.get("collection_names"):
+                knowledge_files.append(
+                    {
+                        "name": item.get("name"),
+                        "type": "collection",
+                        "collection_names": item.get("collection_names"),
+                        "legacy": True,
+                    }
                 )
-        except Exception as e:
-            log.debug(f"Error while building RAG context: {e}")
-            # swallow error to avoid breaking pipeline
+            else:
+                knowledge_files.append(item)
 
-    #ta inja
+        files = form_data.get("files", [])
+        files.extend(knowledge_files)
+        form_data["files"] = files
+
     variables = form_data.pop("variables", None)
 
     # Process the form_data through the pipeline
@@ -1504,11 +1400,12 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                         headers=headers if headers else None,
                     )
 
-                    function_name_filter_list = (
-                        mcp_server_connection.get("config", {})
-                        .get("function_name_filter_list", "")
-                        .split(",")
-                    )
+                    function_name_filter_list = mcp_server_connection.get(
+                        "config", {}
+                    ).get("function_name_filter_list", "")
+
+                    if isinstance(function_name_filter_list, str):
+                        function_name_filter_list = function_name_filter_list.split(",")
 
                     tool_specs = await mcp_clients[server_id].list_tool_specs()
                     for tool_spec in tool_specs:
@@ -2009,7 +1906,7 @@ async def process_chat_response(
                             )
 
                             # Send a webhook notification if the user is not active
-                            if not get_active_status_by_user_id(user.id):
+                            if not Users.is_user_active(user.id):
                                 webhook_url = Users.get_user_webhook_url_by_id(user.id)
                                 if webhook_url:
                                     await post_webhook(
@@ -3304,7 +3201,7 @@ async def process_chat_response(
                     )
 
                 # Send a webhook notification if the user is not active
-                if not get_active_status_by_user_id(user.id):
+                if not Users.is_user_active(user.id):
                     webhook_url = Users.get_user_webhook_url_by_id(user.id)
                     if webhook_url:
                         await post_webhook(
