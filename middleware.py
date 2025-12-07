@@ -1226,7 +1226,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 knowledge_files.append(item)
 
         # ADDED: Local PDF documents handling from new version
-        local_documents_path = "/content/open-webui-middleware/documents"
+        local_documents_path = "open-webui-middleware/documents"
         if os.path.exists(local_documents_path):
             for filename in os.listdir(local_documents_path):
                 if filename.lower().endswith(".pdf"):
