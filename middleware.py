@@ -5,6 +5,11 @@ import os
 import base64
 import textwrap
 
+import os
+import hashlib
+import json
+import PyPDF2
+
 import asyncio
 from aiocache import cached
 from typing import Any, Optional
@@ -1099,6 +1104,11 @@ def apply_params_to_form_data(form_data, model):
     return form_data
 
 
+import os
+import hashlib
+import json
+import PyPDF2
+
 async def process_chat_payload(request, form_data, user, metadata, model):
     # Pipeline Inlet -> Filter Inlet -> Chat Memory -> Chat Web Search -> Chat Image Generation
     # -> Chat Code Interpreter (Form Data Update) -> (Default) Chat Tools Function Calling
@@ -1176,11 +1186,11 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                         *form_data.get("files", []),
                     ]
 
-    # Model "Knowledge" handling
+    # Model "Knowledge" handling - UPDATED WITH LOCAL PDF RAG
     user_message = get_last_user_message(form_data["messages"])
     model_knowledge = model.get("info", {}).get("meta", {}).get("knowledge", False)
 
-    if model_knowledge:
+    if model_knowledge and user_message:
         await event_emitter(
             {
                 "type": "status",
@@ -1192,6 +1202,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             }
         )
 
+        # Original model knowledge handling from collections
         knowledge_files = []
         for item in model_knowledge:
             if item.get("collection_name"):
@@ -1214,9 +1225,71 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             else:
                 knowledge_files.append(item)
 
+        # ADDED: Local PDF documents handling from new version
+        local_documents_path = "/documents"
+        if os.path.exists(local_documents_path):
+            for filename in os.listdir(local_documents_path):
+                if filename.lower().endswith(".pdf"):
+                    full_path = os.path.join(local_documents_path, filename)
+                    file_hash = hashlib.md5(full_path.encode()).hexdigest()[:16]
+                    file_id = f"local_pdf_{file_hash}"
+
+                    knowledge_files.append({
+                        "id": file_id,
+                        "name": filename,
+                        "type": "file",
+                        "source": "local_documents",
+                        "path": full_path,
+                        "legacy": False
+                    })
+
+                    log.debug(f"Knowledge added: {filename}")
+
         files = form_data.get("files", [])
         files.extend(knowledge_files)
         form_data["files"] = files
+
+        # ADDED: Extract text from local PDFs and add to context
+        try:
+            context_text = ""
+            for file_info in knowledge_files:
+                if file_info.get("source") == "local_documents" and file_info.get("path"):
+                    file_path = file_info.get("path")
+                    if os.path.exists(file_path):
+                        with open(file_path, "rb") as f:
+                            reader = PyPDF2.PdfReader(f)
+                            text_output = ""
+                            for page in reader.pages:
+                                text = page.extract_text()
+                                if text and text.strip():
+                                    text_output += text + "\n\n"
+                            if text_output.strip():
+                                context_text += f"\n--- {file_info['name']} ---\n{text_output}\n"
+            
+            if context_text.strip():
+                enhanced_message = (
+                    f"{user_message}\n\n"
+                    f"Please use the following documents as context:\n{context_text}"
+                )
+                form_data["messages"] = add_or_update_user_message(
+                    enhanced_message,
+                    form_data["messages"],
+                    append=False
+                )
+        except Exception as e:
+            log.error(f"Error processing local PDFs: {e}")
+
+        await event_emitter(
+            {
+                "type": "status",
+                "data": {
+                    "action": "knowledge_search",
+                    "query": user_message,
+                    "done": True,
+                    "documents_count": len(knowledge_files),
+                },
+            }
+        )
 
     variables = form_data.pop("variables", None)
 
@@ -1400,12 +1473,11 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                         headers=headers if headers else None,
                     )
 
-                    function_name_filter_list = mcp_server_connection.get(
-                        "config", {}
-                    ).get("function_name_filter_list", "")
-
-                    if isinstance(function_name_filter_list, str):
-                        function_name_filter_list = function_name_filter_list.split(",")
+                    function_name_filter_list = (
+                        mcp_server_connection.get("config", {})
+                        .get("function_name_filter_list", "")
+                        .split(",")
+                    )
 
                     tool_specs = await mcp_clients[server_id].list_tool_specs()
                     for tool_spec in tool_specs:
