@@ -1115,6 +1115,7 @@ def apply_params_to_form_data(form_data, model):
     return form_data
 
 
+#check here
 async def process_chat_payload(request, form_data, user, metadata, model):
     # Pipeline Inlet -> Filter Inlet -> Chat Memory -> Chat Web Search -> Chat Image Generation
     # -> Chat Code Interpreter (Form Data Update) -> (Default) Chat Tools Function Calling
@@ -1129,7 +1130,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             form_data = apply_system_prompt_to_body(
                 system_message.get("content"), form_data, metadata, user, replace=True
             )  # Required to handle system prompt variables
-        except:
+        except Exception:
             pass
 
     event_emitter = get_event_emitter(metadata)
@@ -1196,78 +1197,117 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     model_knowledge = True
 
     if model_knowledge and user_message:
-        await event_emitter({
-            "type": "status",
-            "data": {
-                "action": "documents_search",
-                "query": user_message,
-                "done": False,
-            },
-        })
+        # emit start searching status
+        try:
+            await event_emitter({
+                "type": "status",
+                "data": {
+                    "action": "documents_search",
+                    "query": user_message,
+                    "done": False,
+                },
+            })
+        except Exception:
+            pass
 
-        local_documents_path = "contnet//documents"
+        # Prefer common Colab/path locations; choose first existing
+        candidate_paths = [
+            "/content/documents",
+            "content/documents",
+            "./documents",
+            "/documents",
+        ]
+        local_documents_path = None
+        for p in candidate_paths:
+            if os.path.exists(p) and os.path.isdir(p):
+                local_documents_path = p
+                break
+
         knowledge_files = []
 
-        if os.path.exists(local_documents_path):
+        if local_documents_path:
             for filename in os.listdir(local_documents_path):
-                if filename.lower().endswith(".pdf"):
-                    full_path = os.path.join(local_documents_path, filename)
-                    file_hash = hashlib.md5(full_path.encode()).hexdigest()[:16]
+                if not filename.lower().endswith(".pdf"):
+                    continue
+                full_path = os.path.join(local_documents_path, filename)
+                if not os.path.isfile(full_path):
+                    continue
+                try:
+                    st = os.stat(full_path)
+                    # use path + mtime + size to generate a stable id for file changes
+                    file_hash = hashlib.md5(f"{full_path}_{int(st.st_mtime)}_{st.st_size}".encode()).hexdigest()[:16]
                     file_id = f"local_pdf_{file_hash}"
+                except Exception:
+                    file_id = f"local_pdf_{hash(filename) & 0xFFFF_FFFF:08x}"
 
-                    knowledge_files.append({
-                        "id": file_id,
-                        "name": filename,
-                        "type": "file",
-                        "source": "local_documents",
-                        "path": full_path,
-                        "legacy": False
-                    })
+                knowledge_files.append({
+                    "id": file_id,
+                    "name": filename,
+                    "type": "file",
+                    "source": "local_documents",
+                    "path": full_path,
+                    "legacy": False
+                })
 
-                    print(f"Knowledge added: {filename}")
+                log.debug(f"Knowledge candidate added: {filename}")
 
         existing_metadata_files = metadata.get("files", []) or []
-        existing_ids = {f.get("id") for f in existing_metadata_files}
+        existing_ids = {f.get("id") for f in existing_metadata_files if f.get("id")}
 
         new_knowledge_files = [
             f for f in knowledge_files
             if f.get("id") not in existing_ids
         ]
 
+        # merge into metadata.files
         metadata["files"] = existing_metadata_files + new_knowledge_files
 
-        await event_emitter({
-            "type": "status",
-            "data": {
-                "action": "documents_search",
-                "query": user_message,
-                "done": True,
-                "documents_count": len(new_knowledge_files),
-            },
-        })
-
+        # emit done searching status
         try:
+            await event_emitter({
+                "type": "status",
+                "data": {
+                    "action": "documents_search",
+                    "query": user_message,
+                    "done": True,
+                    "documents_count": len(new_knowledge_files),
+                },
+            })
+        except Exception:
+            pass
 
-            context_text = ""
+        # Build context from new documents and inject into user message (RAG)
+        try:
+            context_text_parts = []
+            # safety cap to avoid extremely large prompts (adjust as needed)
+            MAX_CONTEXT_CHARS = 150_000
 
             for file_info in new_knowledge_files:
                 file_path = file_info.get("path")
                 if not file_path or not os.path.exists(file_path):
                     continue
+                try:
+                    with open(file_path, "rb") as f:
+                        reader = PyPDF2.PdfReader(f)
+                        text_output = ""
+                        for page in reader.pages:
+                            try:
+                                text = page.extract_text()
+                            except Exception:
+                                text = None
+                            if text and text.strip():
+                                text_output += text.strip() + "\n\n"
+                            # break early if too large
+                            if len("".join(context_text_parts)) + len(text_output) > MAX_CONTEXT_CHARS:
+                                break
+                        if text_output.strip():
+                            context_text_parts.append(f"\n--- {file_info['name']} ---\n{text_output}\n")
+                except Exception as e:
+                    log.debug(f"Failed to read PDF {file_path}: {e}")
+                    continue
 
-                with open(file_path, "rb") as f:
-                    reader = PyPDF2.PdfReader(f)
-                    text_output = ""
-
-                    for page in reader.pages:
-                        text = page.extract_text()
-                        if text and text.strip():
-                            text_output += text + "\n\n"
-
-                    if text_output.strip():
-                        context_text += f"\n--- {file_info['name']} ---\n{text_output}\n"
-
-            if context_text.strip():
+            context_text = "".join(context_text_parts).strip()
+            if context_text:
                 enhanced_message = (
                     f"{user_message}\n\n"
                     f"Please use the following documents as context:\n{context_text}"
@@ -1277,11 +1317,11 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                     form_data["messages"],
                     append=False
                 )
-        except:
-            pass
+        except Exception as e:
+            log.debug(f"Error while building RAG context: {e}")
+            # swallow error to avoid breaking pipeline
 
-
-
+    #ta inja
     variables = form_data.pop("variables", None)
 
     # Process the form_data through the pipeline
