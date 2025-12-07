@@ -1296,6 +1296,18 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                     "action": "knowledge_search",
                     "query": user_message,
                     "done": True,
+                    "documents_count": 0,
+                },
+            }
+        )
+
+        await event_emitter(
+            {
+                "type": "status",
+                "data": {
+                    "action": "knowledge_search",
+                    "query": user_message,
+                    "done": True,
                     "documents_count": len(knowledge_files),
                 },
             }
