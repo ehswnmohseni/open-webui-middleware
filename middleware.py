@@ -1226,51 +1226,24 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 knowledge_files.append(item)
 
         # ADDED: Local PDF documents handling from new version
-        #local_documents_path = "open-webui-middleware/documents"
-        #if os.path.exists(local_documents_path):
-            #for filename in os.listdir(local_documents_path):
-                #if filename.lower().endswith(".pdf"):
-                    #full_path = os.path.join(local_documents_path, filename)
-                    #file_hash = hashlib.md5(full_path.encode()).hexdigest()[:16]
-                    #file_id = f"local_pdf_{file_hash}"
+        local_documents_path = "/open-webui-middleware/documents"
+        if os.path.exists(local_documents_path):
+            for filename in os.listdir(local_documents_path):
+                if filename.lower().endswith(".pdf"):
+                    full_path = os.path.join(local_documents_path, filename)
+                    file_hash = hashlib.md5(full_path.encode()).hexdigest()[:16]
+                    file_id = f"local_pdf_{file_hash}"
 
-                    #knowledge_files.append({
-                        #"id": file_id,
-                        #"name": filename,
-                        #"type": "file",
-                        #"source": "local_documents",
-                        #"path": full_path,
-                        #"legacy": False
-                    #})
+                    knowledge_files.append({
+                        "id": file_id,
+                        "name": filename,
+                        "type": "file",
+                        "source": "local_documents",
+                        "path": full_path,
+                        "legacy": False
+                    })
 
-                    #log.debug(f"Knowledge added: {filename}")
-
-
-        fake_pdf_text = "today is 7 december in 16:50 and name is erfan"
-
-        knowledge_files.append({
-            "id": "local_pdf_test",
-            "name": "test_document.txt",
-            "type": "file",
-            "source": "local_documents",
-            "path": None, 
-            "legacy": False,
-            "text_content": fake_pdf_text 
-        })
-
-        context_text = f"\n--- test_document.txt ---\n{fake_pdf_text}\n"
-
-        enhanced_message = (
-            f"{user_message}\n\n"
-            f"Please use the following documents as context:\n{context_text}"
-        )
-
-        form_data["messages"] = add_or_update_user_message(
-            enhanced_message,
-            form_data["messages"],
-            append=False
-        )
-
+                    log.debug(f"Knowledge added: {filename}")
 
         files = form_data.get("files", [])
         files.extend(knowledge_files)
@@ -1278,7 +1251,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
 
         # ADDED: Extract text from local PDFs and add to context
         try:
-            context_text = ""
+            context_text = "your name is fateme & "
             for file_info in knowledge_files:
                 if file_info.get("source") == "local_documents" and file_info.get("path"):
                     file_path = file_info.get("path")
@@ -1292,7 +1265,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                                     text_output += text + "\n\n"
                             if text_output.strip():
                                 context_text += f"\n--- {file_info['name']} ---\n{text_output}\n"
-            
+
             if context_text.strip():
                 enhanced_message = (
                     f"{user_message}\n\n"
@@ -1305,6 +1278,16 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 )
         except Exception as e:
             log.error(f"Error processing local PDFs: {e}")
+            fallback_message = (
+                f"{user_message}\n\n"
+                "We could not process local documents due to an error, "
+                "but you can continue without them."
+            )
+            form_data["messages"] = add_or_update_user_message(
+                fallback_message,
+                form_data["messages"],
+                append=False
+            )
 
         await event_emitter(
             {
