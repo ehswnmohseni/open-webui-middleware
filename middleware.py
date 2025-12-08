@@ -1,5 +1,3 @@
-#if you see this means the changes in middle ware.py saved in colap pip ok ?
-
 import time
 import logging
 import sys
@@ -24,7 +22,6 @@ import ast
 
 from uuid import uuid4
 from concurrent.futures import ThreadPoolExecutor
-
 
 from fastapi import Request, HTTPException
 from fastapi.responses import HTMLResponse
@@ -1105,12 +1102,6 @@ def apply_params_to_form_data(form_data, model):
 
     return form_data
 
-
-import os
-import hashlib
-import json
-import PyPDF2
-
 async def process_chat_payload(request, form_data, user, metadata, model):
     # Pipeline Inlet -> Filter Inlet -> Chat Memory -> Chat Web Search -> Chat Image Generation
     # -> Chat Code Interpreter (Form Data Update) -> (Default) Chat Tools Function Calling
@@ -1188,47 +1179,22 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                         *form_data.get("files", []),
                     ]
 
-    # Model "Knowledge" handling - UPDATED WITH LOCAL PDF RAG
     user_message = get_last_user_message(form_data["messages"])
-    model_knowledge = model.get("info", {}).get("meta", {}).get("knowledge", False)
+    model_knowledge = True
 
     if model_knowledge and user_message:
-        await event_emitter(
-            {
-                "type": "status",
-                "data": {
-                    "action": "knowledge_search",
-                    "query": user_message,
-                    "done": False,
-                },
-            }
-        )
+        await event_emitter({
+            "type": "status",
+            "data": {
+                "action": "documents_search",
+                "query": user_message,
+                "done": False,
+            },
+        })
 
-        # Original model knowledge handling from collections
+        local_documents_path = "/documents"
         knowledge_files = []
-        for item in model_knowledge:
-            if item.get("collection_name"):
-                knowledge_files.append(
-                    {
-                        "id": item.get("collection_name"),
-                        "name": item.get("name"),
-                        "legacy": True,
-                    }
-                )
-            elif item.get("collection_names"):
-                knowledge_files.append(
-                    {
-                        "name": item.get("name"),
-                        "type": "collection",
-                        "collection_names": item.get("collection_names"),
-                        "legacy": True,
-                    }
-                )
-            else:
-                knowledge_files.append(item)
 
-        # ADDED: Local PDF documents handling from new version
-        local_documents_path = "/open-webui-middleware/documents"
         if os.path.exists(local_documents_path):
             for filename in os.listdir(local_documents_path):
                 if filename.lower().endswith(".pdf"):
@@ -1245,28 +1211,48 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                         "legacy": False
                     })
 
-                    log.debug(f"Knowledge added: {filename}")
+                    print(f"Knowledge added: {filename}")
 
-        files = form_data.get("files", [])
-        files.extend(knowledge_files)
-        form_data["files"] = files
+        existing_metadata_files = metadata.get("files", []) or []
+        existing_ids = {f.get("id") for f in existing_metadata_files}
 
-        # ADDED: Extract text from local PDFs and add to context
+        new_knowledge_files = [
+            f for f in knowledge_files
+            if f.get("id") not in existing_ids
+        ]
+
+        metadata["files"] = existing_metadata_files + new_knowledge_files
+
+        await event_emitter({
+            "type": "status",
+            "data": {
+                "action": "documents_search",
+                "query": user_message,
+                "done": True,
+                "documents_count": len(new_knowledge_files),
+            },
+        })
+
         try:
-            context_text = "your name is fateme & "
-            for file_info in knowledge_files:
-                if file_info.get("source") == "local_documents" and file_info.get("path"):
-                    file_path = file_info.get("path")
-                    if os.path.exists(file_path):
-                        with open(file_path, "rb") as f:
-                            reader = PyPDF2.PdfReader(f)
-                            text_output = ""
-                            for page in reader.pages:
-                                text = page.extract_text()
-                                if text and text.strip():
-                                    text_output += text + "\n\n"
-                            if text_output.strip():
-                                context_text += f"\n--- {file_info['name']} ---\n{text_output}\n"
+
+            context_text = ""
+
+            for file_info in new_knowledge_files:
+                file_path = file_info.get("path")
+                if not file_path or not os.path.exists(file_path):
+                    continue
+
+                with open(file_path, "rb") as f:
+                    reader = PyPDF2.PdfReader(f)
+                    text_output = ""
+
+                    for page in reader.pages:
+                        text = page.extract_text()
+                        if text and text.strip():
+                            text_output += text + "\n\n"
+
+                    if text_output.strip():
+                        context_text += f"\n--- {file_info['name']} ---\n{text_output}\n"
 
             if context_text.strip():
                 enhanced_message = (
@@ -1278,42 +1264,10 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                     form_data["messages"],
                     append=False
                 )
-        except Exception as e:
-            log.error(f"Error processing local PDFs: {e}")
-            fallback_message = (
-                f"{user_message}\n\n"
-                "We could not process local documents due to an error, "
-                "but you can continue without them."
-            )
-            form_data["messages"] = add_or_update_user_message(
-                fallback_message,
-                form_data["messages"],
-                append=False
-            )
+        except:
+            pass
 
-        await event_emitter(
-            {
-                "type": "status",
-                "data": {
-                    "action": "knowledge_search",
-                    "query": user_message,
-                    "done": True,
-                    "documents_count": 0,
-                },
-            }
-        )
 
-        await event_emitter(
-            {
-                "type": "status",
-                "data": {
-                    "action": "knowledge_search",
-                    "query": user_message,
-                    "done": True,
-                    "documents_count": len(knowledge_files),
-                },
-            }
-        )
 
     variables = form_data.pop("variables", None)
 
@@ -1672,7 +1626,6 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         )
 
     return form_data, metadata, events
-
 
 async def process_chat_response(
     request, response, form_data, user, metadata, model, events, tasks
